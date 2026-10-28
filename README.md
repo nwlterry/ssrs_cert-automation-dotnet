@@ -6,7 +6,7 @@ Designed for environments where PowerShell is blocked or restricted by server ha
 
 ## Status
 
-This is an early beta. Core rebinding logic is implemented. Event-driven thumbprint extraction is a placeholder and requires refinement before production use.
+This is a beta. The rebind path and the scheduled-task registration path are both in the executable. `--setup` is the replacement for `Deploy-CertificateRenewalTasks.ps1`. It does not call `New-CertificateNotificationTask` (that cmdlet only launches a PowerShell script).
 
 ## Features
 
@@ -30,7 +30,11 @@ Run once (as Administrator) to create the event-triggered task:
 SsrsCertRenewal.exe --setup
 ```
 
-This creates task `SSRS-CertRenewal` that triggers on Event ID 1001 and runs the executable with `--from-latest-event`.
+This creates task `SSRS-CertRenewal` (runs as SYSTEM). On Event ID 1001 it passes the thumbprints from the event, the same fields IIS AutoCertRebind uses:
+
+```cmd
+SsrsCertRenewal.exe --new $(NewCertHash) --old $(OldCertHash) --event $(EventRecordId)
+```
 
 ### Manual / one-off run
 
@@ -44,7 +48,17 @@ SsrsCertRenewal.exe --new <NEW_THUMBPRINT> [--old <OLD_THUMBPRINT>] [--debug]
 SsrsCertRenewal.exe --from-latest-event [--debug]
 ```
 
-> Note: thumbprint extraction from the event is currently a placeholder. Prefer explicit `--new` / `--old` until this is refined.
+This reads the newest Event ID 1001 and takes `NewCertificateDetails/@Thumbprint` and `OldCertificateDetails/@Thumbprint`.
+
+## What the executable covers
+
+| Original PowerShell | .NET |
+| --- | --- |
+| `Deploy-CertificateRenewalTasks.ps1` registers a Replace notification task | `SsrsCertRenewal.exe --setup` registers the Task Scheduler event trigger |
+| Task passes `OldCertHash`, `NewCertHash`, `EventRecordId` | Same three values, via event ValueQueries |
+| `Update-RenewedSystemCertificates_V5.ps1` rebinds SSRS (CN + SAN, template check, WMI, service restart) | Same flow inside the executable |
+| `New-CertificateNotificationTask -RunTaskForExistingCertificates` replays already-renewed certs once at deploy time | Not covered. Run once manually with `--new` / `--old` if a cert was already replaced before the task existed |
+| Deploy only if an "Internal Web Server" cert is in the store | Not a deploy gate. The runtime filter is the template name in `Program.cs` (`Web Server ( Auto Renew )`) |
 
 ## Scheduled Task Setup (PowerShell-free)
 
@@ -56,7 +70,8 @@ SsrsCertRenewal.exe --setup
 
 This registers a task with:
 - Trigger: Event ID **1001** in `Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational`
-- Action: runs this executable with `--from-latest-event`
+- Value queries: `NewCertificateDetails/@Thumbprint`, `OldCertificateDetails/@Thumbprint`, `EventRecordID`
+- Action: `SsrsCertRenewal.exe --new $(NewCertHash) --old $(OldCertHash) --event $(EventRecordId)`
 - Principal: SYSTEM (highest available)
 
 ### Manual alternative
@@ -84,9 +99,9 @@ private const string ExpectedTemplateName = "Web Server ( Auto Renew )";
 
 ## Known Limitations (Beta)
 
-- `--from-latest-event` currently returns placeholder thumbprints. You must parse the Event XML (or pass thumbprints explicitly) before relying on automatic triggering.
 - WMI method parameter order and HRESULT handling should be validated against your specific SSRS version.
-- `--setup` creates the task but the event parser still needs real thumbprint extraction for fully automatic operation.
+- `--setup` does not replay already-replaced certificates (`-RunTaskForExistingCertificates` is not implemented).
+- Template expected at runtime is `Web Server ( Auto Renew )`, not the deploy script's `Internal Web Server` name check.
 
 ## Origin
 
