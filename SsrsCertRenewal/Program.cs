@@ -3,6 +3,7 @@ using System.Management;
 using System.Security.Cryptography.X509Certificates;
 using System.ServiceProcess;
 using System.Text.RegularExpressions;
+using System.Diagnostics;
 
 namespace SsrsCertRenewal;
 
@@ -12,6 +13,7 @@ class Program
     // CONFIGURATION
     // =====================================================================
     private const string ExpectedTemplateName = "Web Server ( Auto Renew )";
+    private const string TaskName = "SSRS-CertRenewal";
     // =====================================================================
 
     private static bool DebugMode = false;
@@ -26,6 +28,7 @@ class Program
         string? oldCertHash = null;
         int? eventRecordId = null;
         bool fromLatestEvent = false;
+        bool setup = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -50,7 +53,15 @@ class Program
                 case "--from-latest-event":
                     fromLatestEvent = true;
                     break;
+                case "--setup":
+                    setup = true;
+                    break;
             }
+        }
+
+        if (setup)
+        {
+            return SetupScheduledTask();
         }
 
         if (fromLatestEvent)
@@ -69,8 +80,10 @@ class Program
 
         if (string.IsNullOrWhiteSpace(newCertHash))
         {
-            Console.WriteLine("Usage: SsrsCertRenewal.exe --new <thumbprint> [--old <thumbprint>] [--event <id>] [--debug]");
-            Console.WriteLine("   or: SsrsCertRenewal.exe --from-latest-event [--debug]");
+            Console.WriteLine("Usage:");
+            Console.WriteLine("  SsrsCertRenewal.exe --setup                  Register scheduled task");
+            Console.WriteLine("  SsrsCertRenewal.exe --new <thumbprint> [--old <thumbprint>] [--debug]");
+            Console.WriteLine("  SsrsCertRenewal.exe --from-latest-event [--debug]");
             return 1;
         }
 
@@ -84,6 +97,116 @@ class Program
             Console.WriteLine($"ERROR: {ex.Message}");
             if (DebugMode) Console.WriteLine(ex);
             return 1;
+        }
+    }
+
+    /// <summary>
+    /// Registers a Task Scheduler task that triggers on CertificateServicesClient Event ID 1001
+    /// and runs this executable with --from-latest-event.
+    /// This replaces the PowerShell Deploy-CertificateRenewalTasks.ps1 function.
+    /// </summary>
+    private static int SetupScheduledTask()
+    {
+        string exePath = Process.GetCurrentProcess().MainModule?.FileName
+            ?? AppContext.BaseDirectory.TrimEnd('\\') + "\\SsrsCertRenewal.exe";
+
+        Console.WriteLine($"Registering scheduled task '{TaskName}'...");
+        Console.WriteLine($"Executable: {exePath}");
+
+        // Task XML with Event trigger on CertificateServicesClient-Lifecycle-System EventID 1001
+        string taskXml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
+<Task version=""1.2"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
+  <RegistrationInfo>
+    <Description>SSRS Certificate Auto-Renewal (triggered by CertificateServicesClient Event ID 1001)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription><QueryList><Query Id=""0"" Path=""Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational""><Select Path=""Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational"">*[System[(EventID=1001)]]</Select></Query></QueryList></Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id=""Author"">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context=""Author"">
+    <Exec>
+      <Command>{exePath}</Command>
+      <Arguments>--from-latest-event</Arguments>
+    </Exec>
+  </Actions>
+</Task>";
+
+        string tempXml = Path.Combine(Path.GetTempPath(), "SsrsCertRenewalTask.xml");
+        File.WriteAllText(tempXml, taskXml);
+
+        try
+        {
+            // Delete existing task if present
+            var deletePsi = new ProcessStartInfo("schtasks", $"/Delete /TN \"{TaskName}\" /F")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using (var del = Process.Start(deletePsi))
+            {
+                del?.WaitForExit(5000);
+            }
+
+            // Create task from XML
+            var createPsi = new ProcessStartInfo("schtasks", $"/Create /TN \"{TaskName}\" /XML \"{tempXml}\" /F")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(createPsi);
+            proc?.WaitForExit();
+            string output = proc?.StandardOutput.ReadToEnd() ?? "";
+            string error = proc?.StandardError.ReadToEnd() ?? "";
+
+            if (proc?.ExitCode == 0)
+            {
+                Console.WriteLine($"Task '{TaskName}' registered successfully.");
+                Console.WriteLine("Trigger: Event ID 1001 in Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational");
+                Console.WriteLine($"Action: {exePath} --from-latest-event");
+                return 0;
+            }
+            else
+            {
+                Console.WriteLine($"Failed to create task. Exit code: {proc?.ExitCode}");
+                Console.WriteLine(output);
+                Console.WriteLine(error);
+                return 1;
+            }
+        }
+        finally
+        {
+            try { File.Delete(tempXml); } catch { }
         }
     }
 
@@ -258,7 +381,6 @@ class Program
     {
         var names = new List<string>();
 
-        // SAN extension OID 2.5.29.17
         var sanExt = cert.Extensions.OfType<X509Extension>()
             .FirstOrDefault(e => e.Oid?.Value == "2.5.29.17");
 
@@ -306,7 +428,6 @@ class Program
         string templateOid = oidMatch.Value;
         if (DebugMode) Console.WriteLine($"Extracted Template OID from Cert: {templateOid}");
 
-        // Method A: ADSI lookup
         try
         {
             using var rootDse = new DirectoryEntry("LDAP://RootDSE");
@@ -338,7 +459,6 @@ class Program
             if (DebugMode) Console.WriteLine($"ADSI Lookup failed, falling back to local string match. ({ex.Message})");
         }
 
-        // Method B: Local fallback
         if (formatted.Contains(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase))
         {
             if (DebugMode) Console.WriteLine("Matched template name via local extension fallback.");
@@ -414,8 +534,6 @@ class Program
 
     private static (string NewThumbprint, string? OldThumbprint, int RecordId)? GetLatestReplaceEvent()
     {
-        // Simplified: look for the most recent Event ID 1001 in the lifecycle log
-        // In production you may want a more precise XPath query against the event XML
         try
         {
             using var session = new System.Diagnostics.Eventing.Reader.EventLogSession();
@@ -431,11 +549,7 @@ class Program
             var evt = reader.ReadEvent();
             if (evt == null) return null;
 
-            // Extract thumbprints from event properties or XML (implementation depends on exact event layout)
-            // This is a placeholder — you will typically parse the Event XML for OldThumbprint / NewThumbprint
-            string xml = evt.ToXml();
-            // TODO: robust parsing of the event XML for the actual thumbprints
-            // For now return the record ID so the caller can decide
+            // Placeholder — real parsing of Event XML for thumbprints should be added
             return ("PLACEHOLDER_NEW", "PLACEHOLDER_OLD", (int)evt.RecordId);
         }
         catch
