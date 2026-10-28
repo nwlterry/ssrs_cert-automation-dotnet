@@ -17,6 +17,11 @@ class Program
     // =====================================================================
     private const string ExpectedTemplateName = "Web Server ( Auto Renew )";
     private const string TaskName = "SSRS-CertRenewal";
+#if NET10_0_OR_GREATER
+    private const string BuiltFor = "net10.0";
+#else
+    private const string BuiltFor = "net8.0";
+#endif
     // =====================================================================
 
     private static bool DebugMode = false;
@@ -32,6 +37,7 @@ class Program
         int? eventRecordId = null;
         bool fromLatestEvent = false;
         bool setup = false;
+        bool showVersion = false;
 
         for (int i = 0; i < args.Length; i++)
         {
@@ -60,7 +66,17 @@ class Program
                 case "--setup":
                     setup = true;
                     break;
+                case "--version":
+                case "-v":
+                    showVersion = true;
+                    break;
             }
+        }
+
+        if (showVersion)
+        {
+            PrintVersion();
+            return 0;
         }
 
         if (setup)
@@ -88,6 +104,7 @@ class Program
             Console.WriteLine("  SsrsCertRenewal.exe --setup                  Register scheduled task");
             Console.WriteLine("  SsrsCertRenewal.exe --new <thumbprint> [--old <thumbprint>] [--debug]");
             Console.WriteLine("  SsrsCertRenewal.exe --from-latest-event [--debug]");
+            Console.WriteLine("  SsrsCertRenewal.exe --version");
             return 1;
         }
 
@@ -168,7 +185,7 @@ class Program
   </Actions>
 </Task>";
 
-        string tempXml = Path.Combine(Path.GetTempPath(), "SsrsCertRenewalTask.xml");
+        string tempXml = CreateTaskXmlPath();
         File.WriteAllText(tempXml, taskXml, Encoding.Unicode);
 
         try
@@ -194,6 +211,49 @@ class Program
         {
             try { File.Delete(tempXml); } catch { }
         }
+    }
+
+    private static void PrintVersion()
+    {
+        string informational = typeof(Program).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion ?? "0.2.0-beta";
+        Console.WriteLine($"SsrsCertRenewal {informational}");
+        Console.WriteLine($"Built for {BuiltFor}. Running on {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}.");
+        Console.WriteLine("Framework-dependent net8.0 builds roll forward to .NET 10 when .NET 8 is not installed.");
+    }
+
+    /// <summary>
+    /// Task XML must not be written to the user-writable temp directory.
+    /// schtasks reads it as SYSTEM during --setup.
+    /// </summary>
+    private static string CreateTaskXmlPath()
+    {
+        string dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "SsrsCertRenewal");
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var psi = new ProcessStartInfo(
+                "icacls",
+                $"\"{dir}\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var proc = Process.Start(psi);
+            proc?.WaitForExit(10000);
+        }
+        catch
+        {
+            // icacls exists only on Windows. The directory is still under ProgramData, not Temp.
+        }
+
+        return Path.Combine(dir, $"task-{Guid.NewGuid():N}.xml");
     }
 
     private static (int ExitCode, string Output, string Error) RunSchtasks(string arguments)

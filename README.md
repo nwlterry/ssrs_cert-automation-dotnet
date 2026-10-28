@@ -18,7 +18,8 @@ This is a beta. The rebind path and the scheduled-task registration path are bot
 - Duplicate event prevention via state file
 - Automatic service restart after successful rebind
 - **`--setup` mode** registers the scheduled task (replaces the PowerShell Deploy script)
-- Self-contained single-file publish (no PowerShell or shared runtime required)
+- Self-contained builds for .NET 8 and .NET 10 (no shared runtime required)
+- Framework-dependent .NET 8 build, which also runs on the .NET 10 runtime when .NET 8 is not installed (`RollForward=LatestMajor`)
 
 ## Execution
 
@@ -78,16 +79,25 @@ This registers a task with:
 
 If you prefer to create the task yourself, use the Task Scheduler GUI or export an XML and import it. The event trigger details are the same as above.
 
+## Which executable to use
+
+| File | Server has | Uses |
+| --- | --- | --- |
+| `SsrsCertRenewal-net8-framework-dependent.exe` | .NET 8 runtime, or only the .NET 10 runtime | Installed runtime. Stays on 8 when 8 is present. Uses 10 only when 8 is not installed |
+| `SsrsCertRenewal-net8-selfcontained.exe` | Nothing extra | Bundled .NET 8 |
+| `SsrsCertRenewal-net10-selfcontained.exe` | Nothing extra | Bundled .NET 10 |
+
+Check the server with `dotnet --list-runtimes`. Hardened servers that do not install a shared runtime should use a self-contained file. Put the file in a directory that only Administrators and SYSTEM can modify, then run `--setup` from that copy. `--version` prints the build target and the runtime actually loaded.
+
 ## Build & Publish
 
-Requires .NET 8 SDK (or later).
+Requires the .NET 10 SDK (it can build both `net8.0` and `net10.0`).
 
 ```bash
-dotnet build -c Release
-dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
+dotnet publish -c Release -f net8.0  -r win-x64 --self-contained false -p:PublishSingleFile=true -o artifacts/net8-framework
+dotnet publish -c Release -f net8.0  -r win-x64 --self-contained true  -p:PublishSingleFile=true -o artifacts/net8-selfcontained
+dotnet publish -c Release -f net10.0 -r win-x64 --self-contained true  -p:PublishSingleFile=true -o artifacts/net10-selfcontained
 ```
-
-The self-contained single-file executable is recommended for hardened servers.
 
 ## Configuration
 
