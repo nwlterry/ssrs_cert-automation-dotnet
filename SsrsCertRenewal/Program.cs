@@ -1,40 +1,41 @@
+using System.Diagnostics;
 using System.DirectoryServices;
 using System.Management;
 using System.Security;
+using System.Security.AccessControl;
 using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text;
-using System.Text.RegularExpressions;
-using System.Diagnostics;
+using System.Xml;
 using System.Xml.Linq;
 
 namespace SsrsCertRenewal;
 
 class Program
 {
-    // =====================================================================
-    // CONFIGURATION
-    // =====================================================================
     private const string ExpectedTemplateName = "Web Server ( Auto Renew )";
     private const string TaskName = "SSRS-CertRenewal";
+    private const int Port = 443;
 #if NET10_0_OR_GREATER
     private const string BuiltFor = "net10.0";
 #else
     private const string BuiltFor = "net8.0";
 #endif
-    // =====================================================================
+
+    private static readonly string[] BroadSids = ["S-1-1-0", "S-1-5-11", "S-1-5-32-545"];
 
     private static bool DebugMode = false;
-    private static readonly string StatePath = Path.Combine(
+    private static readonly string ProtectedDir = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-        "CertificateNotificationTasks");
-    private static readonly string StateFile = Path.Combine(StatePath, "LastProcessedEventRecordId.txt");
+        "SsrsCertRenewal");
+    private static readonly string StateFile = Path.Combine(ProtectedDir, "LastProcessedEventRecordId.txt");
 
     static async Task<int> Main(string[] args)
     {
         string? newCertHash = null;
         string? oldCertHash = null;
-        int? eventRecordId = null;
+        long? eventRecordId = null;
         bool fromLatestEvent = false;
         bool setup = false;
         bool showVersion = false;
@@ -45,16 +46,20 @@ class Program
             {
                 case "--new":
                 case "-n":
-                    newCertHash = args[++i];
+                    if (!TryTake(args, ref i, out newCertHash)) return Usage();
                     break;
                 case "--old":
                 case "-o":
-                    oldCertHash = args[++i];
+                    if (!TryTake(args, ref i, out oldCertHash)) return Usage();
                     break;
                 case "--event":
                 case "-e":
-                    if (int.TryParse(args[++i], out var parsedEventId))
-                        eventRecordId = parsedEventId;
+                    if (!TryTake(args, ref i, out var eventText) || !long.TryParse(eventText, out var parsed) || parsed <= 0)
+                    {
+                        Console.WriteLine("Event record id must be a positive integer.");
+                        return 1;
+                    }
+                    eventRecordId = parsed;
                     break;
                 case "--debug":
                 case "-d":
@@ -70,6 +75,9 @@ class Program
                 case "-v":
                     showVersion = true;
                     break;
+                default:
+                    Console.WriteLine($"Unknown argument: {args[i]}");
+                    return Usage();
             }
         }
 
@@ -79,59 +87,92 @@ class Program
             return 0;
         }
 
-        if (setup)
+        bool renewalRequested = fromLatestEvent || !string.IsNullOrWhiteSpace(newCertHash) || !string.IsNullOrWhiteSpace(oldCertHash);
+        if (setup && renewalRequested)
         {
-            return SetupScheduledTask();
+            Console.WriteLine("Refusing to run --setup together with certificate arguments.");
+            return 1;
         }
+
+        if (setup)
+            return SetupScheduledTask();
 
         if (fromLatestEvent)
         {
             var latest = GetLatestReplaceEvent();
             if (latest == null)
             {
-                Console.WriteLine("No recent certificate replace event found.");
+                Console.WriteLine("No usable certificate replace event found.");
                 return 1;
             }
             newCertHash = latest.Value.NewThumbprint;
             oldCertHash = latest.Value.OldThumbprint;
             eventRecordId = latest.Value.RecordId;
-            Console.WriteLine($"Processing latest event {eventRecordId}: New={newCertHash}, Old={oldCertHash}");
+            Console.WriteLine($"Processing event {eventRecordId}.");
         }
 
-        if (string.IsNullOrWhiteSpace(newCertHash))
+        newCertHash = CertPolicy.NormalizeThumbprint(newCertHash);
+        oldCertHash = string.IsNullOrWhiteSpace(oldCertHash) ? null : CertPolicy.NormalizeThumbprint(oldCertHash);
+        if (newCertHash == null)
+            return Usage();
+        if (oldCertHash == null && !string.IsNullOrWhiteSpace(args.FirstOrDefault(a => a.Equals("--old", StringComparison.OrdinalIgnoreCase) || a.Equals("-o", StringComparison.OrdinalIgnoreCase))))
         {
-            Console.WriteLine("Usage:");
-            Console.WriteLine("  SsrsCertRenewal.exe --setup                  Register scheduled task");
-            Console.WriteLine("  SsrsCertRenewal.exe --new <thumbprint> [--old <thumbprint>] [--debug]");
-            Console.WriteLine("  SsrsCertRenewal.exe --from-latest-event [--debug]");
-            Console.WriteLine("  SsrsCertRenewal.exe --version");
+            Console.WriteLine("Old thumbprint is not 40 hexadecimal characters.");
             return 1;
         }
 
         try
         {
-            await ProcessCertificateRenewal(newCertHash.ToUpperInvariant(), oldCertHash?.ToUpperInvariant(), eventRecordId);
-            return 0;
+            return await ProcessCertificateRenewal(newCertHash, oldCertHash, eventRecordId);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"ERROR: {ex.Message}");
-            if (DebugMode) Console.WriteLine(ex);
+            if (DebugMode) Console.WriteLine(ex.GetType().Name);
             return 1;
         }
     }
 
-    /// <summary>
-    /// Registers a Task Scheduler task triggered by CertificateServicesClient Event ID 1001.
-    /// ValueQueries pass the old/new thumbprints the same way IIS AutoCertRebind does,
-    /// which is the non-PowerShell equivalent of New-CertificateNotificationTask -Type Replace.
-    /// </summary>
+    private static bool TryTake(string[] args, ref int i, out string? value)
+    {
+        if (i + 1 >= args.Length || args[i + 1].StartsWith('-'))
+        {
+            value = null;
+            Console.WriteLine($"Missing value for {args[i]}.");
+            return false;
+        }
+        value = args[++i];
+        return true;
+    }
+
+    private static int Usage()
+    {
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  SsrsCertRenewal.exe --setup");
+        Console.WriteLine("  SsrsCertRenewal.exe --new <thumbprint> [--old <thumbprint>] [--event <id>] [--debug]");
+        Console.WriteLine("  SsrsCertRenewal.exe --from-latest-event [--debug]");
+        Console.WriteLine("  SsrsCertRenewal.exe --version");
+        return 1;
+    }
+
     private static int SetupScheduledTask()
     {
-        string exePath = Process.GetCurrentProcess().MainModule?.FileName
-            ?? Path.Combine(AppContext.BaseDirectory, "SsrsCertRenewal.exe");
+        string exePath = Path.GetFullPath(Process.GetCurrentProcess().MainModule?.FileName
+            ?? Path.Combine(AppContext.BaseDirectory, "SsrsCertRenewal.exe"));
+        string? exeDir = Path.GetDirectoryName(exePath);
+        if (exeDir == null || !File.Exists(exePath))
+        {
+            Console.WriteLine("Could not resolve the executable path.");
+            return 1;
+        }
+        if (DirectoryGrantsWriteToBroadPrincipals(exeDir))
+        {
+            Console.WriteLine("Refusing --setup. The executable directory is writable by Users, Everyone, or Authenticated Users.");
+            Console.WriteLine(exeDir);
+            return 1;
+        }
 
-        Console.WriteLine($"Registering scheduled task '{TaskName}'...");
+        Console.WriteLine($"Registering scheduled task '{TaskName}'.");
         Console.WriteLine($"Executable: {exePath}");
 
         const string query =
@@ -139,6 +180,7 @@ class Program
             "<Select Path=\"Microsoft-Windows-CertificateServicesClient-Lifecycle-System/Operational\">*[System[(EventID=1001)]]</Select>" +
             "</Query></QueryList>";
         string subscription = SecurityElement.Escape(query);
+        string command = SecurityElement.Escape(exePath);
 
         string taskXml = $@"<?xml version=""1.0"" encoding=""UTF-16""?>
 <Task version=""1.4"" xmlns=""http://schemas.microsoft.com/windows/2004/02/mit/task"">
@@ -169,36 +211,36 @@ class Program
     <AllowHardTerminate>true</AllowHardTerminate>
     <StartWhenAvailable>true</StartWhenAvailable>
     <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <AllowStartOnDemand>false</AllowStartOnDemand>
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context=""Author"">
     <Exec>
-      <Command>{SecurityElement.Escape(exePath)}</Command>
-      <Arguments>--new $(NewCertHash) --old $(OldCertHash) --event $(EventRecordId)</Arguments>
+      <Command>{command}</Command>
+      <Arguments>--new ""$(NewCertHash)"" --old ""$(OldCertHash)"" --event ""$(EventRecordId)""</Arguments>
     </Exec>
   </Actions>
 </Task>";
 
-        string tempXml = CreateTaskXmlPath();
+        if (!TryLockDownDirectory(ProtectedDir))
+            return 1;
+
+        string tempXml = Path.Combine(ProtectedDir, $"task-{Guid.NewGuid():N}.xml");
         File.WriteAllText(tempXml, taskXml, Encoding.Unicode);
 
         try
         {
-            RunSchtasks($"/Delete /TN \"{TaskName}\" /F");
-
-            var (code, output, error) = RunSchtasks($"/Create /TN \"{TaskName}\" /XML \"{tempXml}\" /F");
+            RunProcess("schtasks", $"/Delete /TN \"{TaskName}\" /F");
+            var (code, output, error) = RunProcess("schtasks", $"/Create /TN \"{TaskName}\" /XML \"{tempXml}\" /F");
             if (code == 0)
             {
-                Console.WriteLine($"Task '{TaskName}' registered successfully.");
-                Console.WriteLine("Trigger: Event ID 1001 (certificate replace) with OldCertHash / NewCertHash from the event.");
-                Console.WriteLine($"Action: \"{exePath}\" --new $(NewCertHash) --old $(OldCertHash) --event $(EventRecordId)");
-                Console.WriteLine("Runs as NT AUTHORITY\\SYSTEM.");
+                Console.WriteLine($"Task '{TaskName}' registered. It runs as SYSTEM and cannot be started on demand.");
+                Console.WriteLine("Trigger: Event ID 1001. Arguments are quoted thumbprints, not a shell command.");
                 return 0;
             }
 
@@ -218,47 +260,54 @@ class Program
         string informational = typeof(Program).Assembly
             .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
             .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
-            .FirstOrDefault()?.InformationalVersion ?? "0.2.0-beta";
+            .FirstOrDefault()?.InformationalVersion ?? "0.2.1-beta";
         Console.WriteLine($"SsrsCertRenewal {informational}");
         Console.WriteLine($"Built for {BuiltFor}. Running on {System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription}.");
-        Console.WriteLine("Framework-dependent net8.0 builds roll forward to .NET 10 when .NET 8 is not installed.");
     }
 
-    /// <summary>
-    /// Task XML must not be written to the user-writable temp directory.
-    /// schtasks reads it as SYSTEM during --setup.
-    /// </summary>
-    private static string CreateTaskXmlPath()
+    private static bool TryLockDownDirectory(string dir)
     {
-        string dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-            "SsrsCertRenewal");
         Directory.CreateDirectory(dir);
-        try
+        if (!OperatingSystem.IsWindows())
         {
-            var psi = new ProcessStartInfo(
-                "icacls",
-                $"\"{dir}\" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-            using var proc = Process.Start(psi);
-            proc?.WaitForExit(10000);
-        }
-        catch
-        {
-            // icacls exists only on Windows. The directory is still under ProgramData, not Temp.
+            Console.WriteLine("ACL lockdown is only available on Windows.");
+            return false;
         }
 
-        return Path.Combine(dir, $"task-{Guid.NewGuid():N}.xml");
+        string grant = $"\"{dir}\" /inheritance:r /T /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F";
+        var (code, _, error) = RunProcess("icacls", grant);
+        if (code != 0)
+        {
+            RunProcess("takeown", $"/F \"{dir}\" /A");
+            (code, _, error) = RunProcess("icacls", grant);
+        }
+        if (code != 0 || DirectoryGrantsWriteToBroadPrincipals(dir))
+        {
+            Console.WriteLine("Could not restrict the data directory to SYSTEM and Administrators.");
+            if (!string.IsNullOrWhiteSpace(error)) Console.WriteLine(error);
+            return false;
+        }
+        return true;
     }
 
-    private static (int ExitCode, string Output, string Error) RunSchtasks(string arguments)
+    private static bool DirectoryGrantsWriteToBroadPrincipals(string directory)
     {
-        var psi = new ProcessStartInfo("schtasks", arguments)
+        if (!OperatingSystem.IsWindows()) return false;
+        var acl = new DirectoryInfo(directory).GetAccessControl();
+        foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        {
+            if (rule.AccessControlType != AccessControlType.Allow) continue;
+            if (!BroadSids.Contains(rule.IdentityReference.Value, StringComparer.OrdinalIgnoreCase)) continue;
+            var rights = rule.FileSystemRights;
+            if ((rights & (FileSystemRights.Write | FileSystemRights.Modify | FileSystemRights.FullControl | FileSystemRights.CreateFiles | FileSystemRights.WriteData)) != 0)
+                return true;
+        }
+        return false;
+    }
+
+    private static (int ExitCode, string Output, string Error) RunProcess(string fileName, string arguments)
+    {
+        var psi = new ProcessStartInfo(fileName, arguments)
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -266,312 +315,258 @@ class Program
             CreateNoWindow = true
         };
         using var proc = Process.Start(psi);
-        if (proc == null) return (1, "", "Failed to start schtasks.");
+        if (proc == null) return (1, "", $"Failed to start {fileName}.");
         string output = proc.StandardOutput.ReadToEnd();
         string error = proc.StandardError.ReadToEnd();
         proc.WaitForExit();
         return (proc.ExitCode, output, error);
     }
 
-    private static async Task ProcessCertificateRenewal(string newCertHash, string? oldCertHash, int? eventRecordId)
+    private static async Task<int> ProcessCertificateRenewal(string newCertHash, string? oldCertHash, long? eventRecordId)
     {
-        if (DebugMode) Console.WriteLine("=== DEBUG MODE ENABLED ===");
+        if (!TryLockDownDirectory(ProtectedDir))
+            return 1;
 
-        // 1. Duplicate Execution Prevention
-        if (eventRecordId.HasValue)
+        if (eventRecordId is > 0 && await AlreadyProcessed(eventRecordId.Value))
         {
-            Directory.CreateDirectory(StatePath);
-            int lastId = 0;
-            if (File.Exists(StateFile))
-            {
-                int.TryParse(await File.ReadAllTextAsync(StateFile), out lastId);
-            }
-            if (eventRecordId.Value <= lastId)
-            {
-                Console.WriteLine($"Event {eventRecordId} already processed. Exiting.");
-                return;
-            }
+            Console.WriteLine($"Event {eventRecordId} already processed. Exiting.");
+            return 0;
         }
 
-        // Load certificate
         using var store = new X509Store(StoreName.My, StoreLocation.LocalMachine);
         store.Open(OpenFlags.ReadOnly);
         var newCert = store.Certificates.Find(X509FindType.FindByThumbprint, newCertHash, false).FirstOrDefault();
         if (newCert == null)
-            throw new Exception($"New certificate {newCertHash} not found in LocalMachine\\My store.");
-
-        if (DebugMode) Console.WriteLine($"New Cert Subject : {newCert.Subject}");
-
-        // 2. Extract DNS Names (SAN + CN)
-        var dnsNames = ExtractDnsNames(newCert);
-        if (DebugMode) Console.WriteLine($"DNS Names: {string.Join(", ", dnsNames)}");
-
-        // 3. Verify Certificate Template Match
-        if (!string.IsNullOrEmpty(ExpectedTemplateName) && !VerifyTemplate(newCert))
         {
-            Console.WriteLine($"Certificate template does not match expected name: '{ExpectedTemplateName}'. Skipping.");
-            if (eventRecordId.HasValue) await File.WriteAllTextAsync(StateFile, eventRecordId.Value.ToString());
-            return;
+            Console.WriteLine("New certificate was not found in LocalMachine\\My.");
+            return 1;
         }
 
-        // 4. Discover SSRS instances
+        if (!CertPolicy.HasUsablePrivateKey(newCert))
+        {
+            Console.WriteLine("New certificate has no usable private key. Skipping.");
+            return 1;
+        }
+        if (!CertPolicy.IsTimeValid(newCert, DateTime.UtcNow))
+        {
+            Console.WriteLine("New certificate is outside its validity period. Skipping.");
+            return 1;
+        }
+        if (!CertPolicy.HasServerAuthEku(newCert))
+        {
+            Console.WriteLine("New certificate does not have the Server Authentication EKU. Skipping.");
+            return 1;
+        }
+        if (!CertPolicy.ChainIsTrusted(newCert, out string chainError))
+        {
+            Console.WriteLine($"New certificate chain was rejected: {chainError}");
+            return 1;
+        }
+        if (!VerifyTemplate(newCert))
+        {
+            Console.WriteLine($"Certificate template does not match '{ExpectedTemplateName}'. Skipping.");
+            return 1;
+        }
+
+        var dnsNames = CertPolicy.GetDnsNames(newCert);
+        if (dnsNames.Count == 0)
+        {
+            Console.WriteLine("Certificate has no acceptable DNS host name. Skipping.");
+            return 1;
+        }
+        if (DebugMode) Console.WriteLine($"DNS names: {string.Join(", ", dnsNames)}");
+
+        X509Certificate2? oldCert = null;
+        if (oldCertHash != null)
+        {
+            oldCert = store.Certificates.Find(X509FindType.FindByThumbprint, oldCertHash, false).FirstOrDefault();
+            if (oldCert != null && !CertPolicy.SharesIdentity(newCert, oldCert))
+            {
+                Console.WriteLine("New certificate does not share a DNS name or subject with the old certificate. Skipping.");
+                return 1;
+            }
+        }
+
         var configs = DiscoverSsrsConfigs();
         if (configs.Count == 0)
         {
             Console.WriteLine("No SSRS or PBIRS instances found on this server.");
-            return;
+            return 1;
         }
 
-        const int port = 443;
         int lcid = System.Globalization.CultureInfo.CurrentCulture.LCID;
-
         bool anySuccess = false;
 
         foreach (var config in configs)
         {
-            Console.WriteLine($"\n=== Processing SSRS Instance: {config.InstanceName} ===");
-            if (DebugMode)
+            Console.WriteLine($"Processing SSRS instance: {config.InstanceName}");
+            if (!config.IsInitialized)
             {
-                Console.WriteLine($" IsInitialized : {config.IsInitialized}");
-                Console.WriteLine($" ServiceName   : {config.ServiceName}");
+                Console.WriteLine("Instance is not initialized. Certificate binding was not changed.");
+                continue;
             }
 
-            bool instanceSuccess = false;
+            bool instanceChanged = false;
 
             foreach (var app in new[] { "ReportServerWebService", "ReportServerWebApp" })
             {
-                Console.WriteLine($"-> Application: {app}");
-
-                foreach (var name in dnsNames)
+                var current = ListBindingHashes(config.ManagementObject, app, lcid);
+                bool hasCurrent = current.Count > 0;
+                bool oldIsCurrent = oldCertHash != null && current.Contains(oldCertHash);
+                if (hasCurrent && !oldIsCurrent)
                 {
-                    var url = $"https://{name}:{port}";
-                    try
-                    {
-                        var result = InvokeMethod(config.ManagementObject, "ReserveURL", new object[] { app, url, lcid });
-                        int hresult = Convert.ToInt32(result["HRESULT"]);
-                        if (hresult == 0)
-                        {
-                            Console.WriteLine($"   ReserveURL {url} → Success (0)");
-                            instanceSuccess = true;
-                        }
-                        else if (hresult == -2147220932)
-                        {
-                            Console.WriteLine($"   ReserveURL {url} → Already Reserved (OK)");
-                            instanceSuccess = true;
-                        }
-                        else
-                        {
-                            Console.WriteLine($"   ReserveURL {url} → HRESULT: {hresult}");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"   ReserveURL failed for {url} : {ex.Message}");
-                    }
+                    Console.WriteLine($"  {app}: current binding does not match the old thumbprint. Not changed.");
+                    continue;
                 }
 
-                if (!string.IsNullOrEmpty(oldCertHash))
+                foreach (string name in dnsNames)
                 {
-                    try
-                    {
-                        var result = InvokeMethod(config.ManagementObject, "RemoveSSLCertificateBinding",
-                            new object[] { app, oldCertHash.ToLowerInvariant(), "0.0.0.0", port, lcid });
-                        Console.WriteLine($"   RemoveSSLCertificateBinding (Old Cert) → HRESULT: {result["HRESULT"]}");
-                    }
-                    catch
-                    {
-                        Console.WriteLine("   RemoveSSLCertificateBinding: No old binding found or removal failed.");
-                    }
+                    string url = $"https://{name}:{Port}";
+                    int reserved = InvokeNamed(config.ManagementObject, "ReserveURL", ("Application", app), ("UrlString", url), ("Lcid", lcid));
+                    if (reserved == 0 || reserved == -2147220932)
+                        Console.WriteLine($"  ReserveURL {url} -> {reserved}");
+                    else
+                        Console.WriteLine($"  ReserveURL {url} failed: {reserved}");
                 }
 
-                try
-                {
-                    var result = InvokeMethod(config.ManagementObject, "CreateSSLCertificateBinding",
-                        new object[] { app, newCertHash.ToLowerInvariant(), "0.0.0.0", port, lcid });
-                    int hresult = Convert.ToInt32(result["HRESULT"]);
-                    Console.WriteLine($"   CreateSSLCertificateBinding (New Cert) → HRESULT: {hresult}");
-                    if (hresult == 0) instanceSuccess = true;
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"   CreateSSLCertificateBinding failed: {ex.Message}");
-                }
-            }
+                int created = InvokeNamed(
+                    config.ManagementObject,
+                    "CreateSSLCertificateBinding",
+                    ("Application", app),
+                    ("CertificateHash", newCertHash.ToLowerInvariant()),
+                    ("IPAddress", "0.0.0.0"),
+                    ("Port", Port),
+                    ("Lcid", lcid));
+                Console.WriteLine($"  CreateSSLCertificateBinding -> {created}");
+                if (created != 0) continue;
 
-            if (!config.IsInitialized)
-            {
-                try
-                {
-                    Console.WriteLine("Initializing Report Server...");
-                    InvokeMethod(config.ManagementObject, "InitializeReportServer", new object[] { config.InstallationID });
-                    Console.WriteLine("✓ Initialization completed.");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Failed to initialize server: {ex.Message}");
-                }
-            }
-
-            if (instanceSuccess)
-            {
+                instanceChanged = true;
                 anySuccess = true;
-                string serviceName = config.ServiceName ?? "SQLServerReportingServices";
-                Console.WriteLine($"Restarting '{serviceName}' service to apply bindings...");
-                try
+                if (oldIsCurrent && !oldCertHash!.Equals(newCertHash, StringComparison.OrdinalIgnoreCase))
                 {
-                    using var sc = new ServiceController(serviceName);
-                    if (sc.Status != ServiceControllerStatus.Stopped)
-                        sc.Stop();
-                    sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
-                    sc.Start();
-                    sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
-                    Console.WriteLine("✓ Service restarted successfully.");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Failed to restart service '{serviceName}'. You may need to restart it manually. Error: {ex.Message}");
+                    int removed = InvokeNamed(
+                        config.ManagementObject,
+                        "RemoveSSLCertificateBinding",
+                        ("Application", app),
+                        ("CertificateHash", oldCertHash.ToLowerInvariant()),
+                        ("IPAddress", "0.0.0.0"),
+                        ("Port", Port),
+                        ("Lcid", lcid));
+                    Console.WriteLine($"  RemoveSSLCertificateBinding -> {removed}");
                 }
             }
+
+            if (instanceChanged)
+                RestartIfAllowed(config.ServiceName);
         }
 
-        if (eventRecordId.HasValue && anySuccess)
-            await File.WriteAllTextAsync(StateFile, eventRecordId.Value.ToString());
+        if (eventRecordId is > 0 && anySuccess)
+            await WriteStateAsync(eventRecordId.Value);
 
-        Console.WriteLine("\nUniversal SSRS certificate auto-renewal and rebind processing completed.");
+        Console.WriteLine(anySuccess
+            ? "Certificate rebind completed."
+            : "No SSRS binding was changed.");
+        return anySuccess ? 0 : 1;
     }
 
-    private static List<string> ExtractDnsNames(X509Certificate2 cert)
+    private static async Task<bool> AlreadyProcessed(long eventRecordId)
     {
-        var names = new List<string>();
+        if (!File.Exists(StateFile)) return false;
+        string text = await File.ReadAllTextAsync(StateFile);
+        return long.TryParse(text.Trim(), out long last) && eventRecordId <= last;
+    }
 
-        var sanExt = cert.Extensions.OfType<X509Extension>()
-            .FirstOrDefault(e => e.Oid?.Value == "2.5.29.17");
-
-        if (sanExt != null)
-        {
-            var formatted = sanExt.Format(true);
-            foreach (var line in formatted.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (line.StartsWith("DNS Name=", StringComparison.OrdinalIgnoreCase))
-                    names.Add(line.Substring("DNS Name=".Length).Trim());
-            }
-        }
-
-        if (names.Count == 0 && cert.Subject.Contains("CN="))
-        {
-            var match = Regex.Match(cert.Subject, @"CN=([^,]+)");
-            if (match.Success)
-                names.Add(match.Groups[1].Value.Trim());
-        }
-
-        return names.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    private static async Task WriteStateAsync(long eventRecordId)
+    {
+        string tmp = StateFile + ".tmp";
+        await File.WriteAllTextAsync(tmp, eventRecordId.ToString());
+        if (File.Exists(StateFile)) File.Replace(tmp, StateFile, null);
+        else File.Move(tmp, StateFile);
     }
 
     private static bool VerifyTemplate(X509Certificate2 cert)
     {
-        Console.WriteLine($"Template verification active. Expecting: '{ExpectedTemplateName}'");
-
-        var templateExt = cert.Extensions.OfType<X509Extension>()
-            .FirstOrDefault(e => e.Oid?.Value == "1.3.6.1.4.1.311.21.7");
-
+        var templateExt = cert.Extensions.OfType<X509Extension>().FirstOrDefault(e => e.Oid?.Value == "1.3.6.1.4.1.311.21.7");
         if (templateExt == null)
         {
-            Console.WriteLine("No Template Information OID found on certificate. Skipping.");
+            Console.WriteLine("No certificate template extension.");
             return false;
         }
 
-        var formatted = templateExt.Format(false);
-        var oidMatch = Regex.Match(formatted, @"1\.3\.6\.1\.4\.1\.311\.21\.8\.[0-9.]+");
-        if (!oidMatch.Success)
+        string? templateOid = CertPolicy.ExtractTemplateOid(templateExt.Format(false));
+        if (templateOid == null)
         {
-            Console.WriteLine("Could not parse Template OID string from certificate extension. Skipping.");
+            Console.WriteLine("Could not parse a certificate template OID.");
             return false;
         }
-
-        string templateOid = oidMatch.Value;
-        if (DebugMode) Console.WriteLine($"Extracted Template OID from Cert: {templateOid}");
 
         try
         {
             using var rootDse = new DirectoryEntry("LDAP://RootDSE");
-            string configContext = rootDse.Properties["configurationNamingContext"][0].ToString()!;
+            string? configContext = rootDse.Properties["configurationNamingContext"][0]?.ToString();
+            if (string.IsNullOrWhiteSpace(configContext)) return false;
             string searchRoot = $"LDAP://CN=Certificate Templates,CN=Public Key Services,CN=Services,{configContext}";
 
             using var searcher = new DirectorySearcher(new DirectoryEntry(searchRoot))
             {
                 Filter = $"(&(objectClass=pKICertificateTemplate)(msPKI-Cert-Template-OID={templateOid}))"
             };
-
             var result = searcher.FindOne();
-            if (result != null)
-            {
-                string adName = result.Properties["name"][0]?.ToString() ?? "";
-                string adDisplay = result.Properties["displayname"][0]?.ToString() ?? "";
-                if (DebugMode) Console.WriteLine($"Resolved OID in AD to Template: {adName} / {adDisplay}");
+            if (result == null) return false;
 
-                if (adName.Equals(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase) ||
-                    adDisplay.Equals(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"✓ Certificate verified. Matches template: {ExpectedTemplateName}");
-                    return true;
-                }
-            }
+            string adName = result.Properties["name"][0]?.ToString() ?? "";
+            string adDisplay = result.Properties["displayname"][0]?.ToString() ?? "";
+            bool match = adName.Equals(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase)
+                || adDisplay.Equals(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase);
+            if (!match)
+                Console.WriteLine("Active Directory template name did not match. No local-name fallback is used.");
+            return match;
         }
         catch (Exception ex)
         {
-            if (DebugMode) Console.WriteLine($"ADSI Lookup failed, falling back to local string match. ({ex.Message})");
+            Console.WriteLine($"Active Directory template lookup failed. Certificate was not accepted. {ex.Message}");
+            return false;
         }
-
-        if (formatted.Contains(ExpectedTemplateName, StringComparison.OrdinalIgnoreCase))
-        {
-            if (DebugMode) Console.WriteLine("Matched template name via local extension fallback.");
-            Console.WriteLine($"✓ Certificate verified. Matches template: {ExpectedTemplateName}");
-            return true;
-        }
-
-        return false;
     }
 
     private static List<SsrsConfig> DiscoverSsrsConfigs()
     {
         var results = new List<SsrsConfig>();
         const string rootNs = @"root\Microsoft\SqlServer\ReportServer";
-
         try
         {
             using var searcher = new ManagementObjectSearcher("\\\\.\\" + rootNs, "SELECT * FROM __NAMESPACE");
             foreach (ManagementObject instanceNs in searcher.Get())
             {
                 string instance = instanceNs["Name"]?.ToString() ?? "";
-                if (string.IsNullOrEmpty(instance)) continue;
+                if (!CertPolicy.IsSafeWmiToken(instance)) continue;
 
-                string instancePath = $"{rootNs}\\{instance}";
+                string instancePath = rootNs + "\\" + instance;
                 using var verSearcher = new ManagementObjectSearcher("\\\\.\\" + instancePath, "SELECT * FROM __NAMESPACE");
                 foreach (ManagementObject versionNs in verSearcher.Get())
                 {
                     string version = versionNs["Name"]?.ToString() ?? "";
-                    if (string.IsNullOrEmpty(version)) continue;
+                    if (!CertPolicy.IsSafeWmiToken(version)) continue;
 
-                    string targetNs = $"{instancePath}\\{version}\\Admin";
+                    string targetNs = instancePath + "\\" + version + "\\Admin";
                     try
                     {
                         using var configSearcher = new ManagementObjectSearcher("\\\\.\\" + targetNs, "SELECT * FROM MSReportServer_ConfigurationSetting");
                         foreach (ManagementObject mo in configSearcher.Get())
                         {
+                            string? serviceName = mo["ServiceName"]?.ToString();
                             results.Add(new SsrsConfig
                             {
                                 ManagementObject = mo,
                                 InstanceName = mo["InstanceName"]?.ToString() ?? instance,
-                                ServiceName = mo["ServiceName"]?.ToString(),
-                                IsInitialized = Convert.ToBoolean(mo["IsInitialized"] ?? false),
-                                InstallationID = mo["InstallationID"]?.ToString()
+                                ServiceName = CertPolicy.IsAllowedServiceName(serviceName) ? serviceName : null,
+                                IsInitialized = Convert.ToBoolean(mo["IsInitialized"] ?? false)
                             });
-                            if (DebugMode) Console.WriteLine($"Discovered SSRS Namespace: {targetNs}");
                         }
                     }
                     catch
                     {
-                        if (DebugMode) Console.WriteLine($"No ConfigurationSetting found in {targetNs}");
+                        if (DebugMode) Console.WriteLine($"No configuration found in {targetNs}");
                     }
                 }
             }
@@ -580,22 +575,107 @@ class Program
         {
             if (DebugMode) Console.WriteLine($"WMI discovery error: {ex.Message}");
         }
-
         return results;
     }
 
-    private static ManagementBaseObject InvokeMethod(ManagementObject mo, string methodName, object[] args)
+    private static HashSet<string> ListBindingHashes(ManagementObject mo, string app, int lcid)
     {
-        var inParams = mo.GetMethodParameters(methodName);
-        var paramNames = inParams.Properties.Cast<PropertyData>().Select(p => p.Name).ToArray();
-
-        for (int i = 0; i < args.Length && i < paramNames.Length; i++)
-            inParams[paramNames[i]] = args[i];
-
-        return mo.InvokeMethod(methodName, inParams, null);
+        var hashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var inParams = mo.GetMethodParameters("ListSSLCertificateBindings");
+            SetParam(inParams, "Lcid", lcid);
+            var result = mo.InvokeMethod("ListSSLCertificateBindings", inParams, null);
+            string[] apps = ReadStrings(result, "Application");
+            string[] certs = ReadStrings(result, "CertificateHash");
+            int n = Math.Min(apps.Length, certs.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (!app.Equals(apps[i], StringComparison.OrdinalIgnoreCase)) continue;
+                string? hash = CertPolicy.NormalizeThumbprint(certs[i]);
+                if (hash != null) hashes.Add(hash);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  Could not list current SSL bindings: {ex.Message}");
+        }
+        return hashes;
     }
 
-    private static (string NewThumbprint, string? OldThumbprint, int RecordId)? GetLatestReplaceEvent()
+    private static int InvokeNamed(ManagementObject mo, string method, params (string Name, object Value)[] args)
+    {
+        var inParams = mo.GetMethodParameters(method);
+        foreach (var (name, value) in args)
+        {
+            if (!SetParam(inParams, name, value))
+                throw new InvalidOperationException($"WMI method {method} has no {name} parameter.");
+        }
+        var result = mo.InvokeMethod(method, inParams, null);
+        return Convert.ToInt32(result["HRESULT"]);
+    }
+
+    private static bool SetParam(ManagementBaseObject bag, string name, object value)
+    {
+        foreach (PropertyData property in bag.Properties)
+        {
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                bag[property.Name] = value;
+                return true;
+            }
+        }
+        if (name.Equals("Lcid", StringComparison.OrdinalIgnoreCase))
+            return SetParam(bag, "LCID", value);
+        if (name.Equals("UrlString", StringComparison.OrdinalIgnoreCase))
+            return SetParam(bag, "Url", value);
+        return false;
+    }
+
+    private static string[] ReadStrings(ManagementBaseObject result, string name)
+    {
+        object? value = null;
+        foreach (PropertyData property in result.Properties)
+        {
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                break;
+            }
+        }
+        return value switch
+        {
+            string[] many => many,
+            string one => [one],
+            _ => []
+        };
+    }
+
+    private static void RestartIfAllowed(string? serviceName)
+    {
+        if (!CertPolicy.IsAllowedServiceName(serviceName))
+        {
+            Console.WriteLine("Service name is not an SSRS or PBIRS service. Not restarted.");
+            return;
+        }
+
+        try
+        {
+            using var sc = new ServiceController(serviceName!);
+            if (sc.Status != ServiceControllerStatus.Stopped)
+                sc.Stop();
+            sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+            sc.Start();
+            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(60));
+            Console.WriteLine($"Restarted {serviceName}.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not restart {serviceName}. Restart it manually. {ex.Message}");
+        }
+    }
+
+    private static (string NewThumbprint, string? OldThumbprint, long RecordId)? GetLatestReplaceEvent()
     {
         try
         {
@@ -611,20 +691,23 @@ class Program
             var evt = reader.ReadEvent();
             if (evt == null) return null;
 
-            string xml = evt.ToXml();
-            if (DebugMode) Console.WriteLine(xml);
-
-            var doc = XDocument.Parse(xml);
-            string? newThumb = FindThumbprint(doc, "NewCertificateDetails");
-            string? oldThumb = FindThumbprint(doc, "OldCertificateDetails");
-            if (string.IsNullOrWhiteSpace(newThumb))
+            var settings = new XmlReaderSettings
             {
-                Console.WriteLine("Event 1001 was found but NewCertificateDetails/@Thumbprint was missing.");
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null
+            };
+            using var xmlReader = XmlReader.Create(new StringReader(evt.ToXml()), settings);
+            var doc = XDocument.Load(xmlReader);
+            string? newThumb = CertPolicy.NormalizeThumbprint(FindThumbprint(doc, "NewCertificateDetails"));
+            string? oldThumb = CertPolicy.NormalizeThumbprint(FindThumbprint(doc, "OldCertificateDetails"));
+            if (newThumb == null)
+            {
+                Console.WriteLine("Event 1001 did not contain a 40-character new thumbprint.");
                 return null;
             }
 
-            int recordId = evt.RecordId.HasValue ? (int)evt.RecordId.Value : 0;
-            return (newThumb, string.IsNullOrWhiteSpace(oldThumb) ? null : oldThumb, recordId);
+            long recordId = evt.RecordId ?? 0;
+            return (newThumb, oldThumb, recordId);
         }
         catch (Exception ex)
         {
@@ -637,21 +720,15 @@ class Program
     {
         var element = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == elementLocalName);
         if (element == null) return null;
-
-        string? value = element.Attribute("Thumbprint")?.Value
+        return element.Attribute("Thumbprint")?.Value
             ?? element.Elements().FirstOrDefault(e => e.Name.LocalName == "Thumbprint")?.Value;
-        if (string.IsNullOrWhiteSpace(value)) return null;
-
-        value = value.Replace(" ", "", StringComparison.Ordinal).Trim();
-        return value.Length == 0 ? null : value;
     }
 
-    private class SsrsConfig
+    private sealed class SsrsConfig
     {
         public ManagementObject ManagementObject { get; set; } = null!;
         public string InstanceName { get; set; } = "";
         public string? ServiceName { get; set; }
         public bool IsInitialized { get; set; }
-        public string? InstallationID { get; set; }
     }
 }

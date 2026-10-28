@@ -107,11 +107,13 @@ Edit the expected template name near the top of `Program.cs` if your environment
 private const string ExpectedTemplateName = "Web Server ( Auto Renew )";
 ```
 
-## Known Limitations (Beta)
+## Known limitations
 
-- WMI method parameter order and HRESULT handling should be validated against your specific SSRS version.
-- `--setup` does not replay already-replaced certificates (`-RunTaskForExistingCertificates` is not implemented).
-- Template expected at runtime is `Web Server ( Auto Renew )`, not the deploy script's `Internal Web Server` name check.
+- WMI parameter names are matched by name (`Application`, `CertificateHash`, `IPAddress`, `Port`, `Lcid`, `UrlString`). Confirm them against the SSRS version before production use.
+- `--setup` does not replay certificates that were already replaced (`-RunTaskForExistingCertificates` is not implemented).
+- The accepted template name is `Web Server ( Auto Renew )` in `Program.cs`.
+- An uninitialized report server is left unchanged. This build does not call `InitializeReportServer`.
+- See [SECURITY.md](SECURITY.md) for the v0.2.0-beta review and what v0.2.1-beta changes.
 
 ## Origin
 

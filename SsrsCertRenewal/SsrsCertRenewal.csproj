@@ -6,8 +6,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>SsrsCertRenewal</AssemblyName>
-    <Version>0.2.0-beta</Version>
-    <InformationalVersion>0.2.0-beta</InformationalVersion>
+    <Version>0.2.1-beta</Version>
+    <InformationalVersion>0.2.1-beta</InformationalVersion>
     <!-- net8.0 framework-dependent build uses .NET 8 when it is installed, and .NET 10 when it is not. -->
     <RollForward>Major</RollForward>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
@@ -17,6 +17,7 @@
     <PackageReference Include="System.Diagnostics.EventLog" Version="8.0.1" />
     <PackageReference Include="System.DirectoryServices" Version="8.0.0" />
     <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="System.IO.FileSystem.AccessControl" Version="5.0.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
   </ItemGroup>
 
